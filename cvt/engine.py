@@ -77,6 +77,8 @@ def validate_settings(s):
         errs.append("Settle tolerance must be positive.")
     if s.smoothing_C <= 0:
         errs.append("Smoothing width must be positive.")
+    if s.speed not in ("SLOW", "MED", "FAST"):
+        errs.append("LCR speed must be SLOW, MED or FAST.")
     if not 1 <= s.average <= 255:
         errs.append("LCR averaging must be 1-255.")
     return errs

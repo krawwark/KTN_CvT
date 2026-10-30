@@ -1,6 +1,5 @@
 """Tkinter front end: settings form, live plots, start/stop, re-analysis."""
 import json
-import os
 import queue
 import tkinter as tk
 from dataclasses import asdict, fields
@@ -13,11 +12,14 @@ from matplotlib.figure import Figure
 
 from . import analysis
 from .engine import MeasurementRun, RunSettings, ramp_minutes, validate_settings
+from .help_text import HELP
 from .sim import SIM_SPEED
 
 SETTINGS_PATH = Path.home() / ".cvt_settings.json"
 BAUD_RATES = ["9600", "19200", "38400", "57600", "115200"]
 FREQUENCIES = ["50", "60", "100", "120", "1k", "10k"]  # as listed for the FREQ command
+# Fixed meter presets; measurement rates are the manual's figures at 1 kHz.
+SPEED_LABELS = {"SLOW": "SLOW (~3 Hz)", "MED": "MED (~10 Hz)", "FAST": "FAST (≤30 Hz)"}
 FIELD_TYPES = {f.name: f.type for f in fields(RunSettings)}
 
 
@@ -40,9 +42,14 @@ class App:
         self.rows = []
         self.dirty = False
         self.current_settings = RunSettings()
+        self._tip = None        # open info popup
+        self._tip_icon = None   # the ⓘ that opened it
 
         root.title("C–T Measurement")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.bind("<Button-1>", self._click_away, add="+")
+        root.bind("<Escape>", lambda e: self._hide_info(), add="+")
+        root.bind("<Configure>", lambda e: e.widget is root and self._hide_info(), add="+")
         root.columnconfigure(1, weight=1)
         root.rowconfigure(0, weight=1)
 
@@ -82,9 +89,53 @@ class App:
             else:
                 w = ttk.Entry(frame, textvariable=var, width=width)
             w.grid(row=row, column=1, sticky="ew", pady=2)
+        if key in HELP:
+            self._info_icon(frame, label, HELP[key]).grid(row=row, column=3, padx=(4, 0))
         self.vars[key] = (var, label)
         self.inputs.append(w)
         return w
+
+    # -- info popups --------------------------------------------------------
+
+    def _info_icon(self, parent, title, text):
+        icon = ttk.Label(parent, text="ⓘ", font=("Segoe UI Symbol", 11),
+                         foreground=analysis.COLORS["series1"], cursor="hand2")
+        icon.is_info_icon = True
+        icon.bind("<Button-1>", lambda e: self._toggle_info(icon, title, text))
+        return icon
+
+    def _toggle_info(self, icon, title, text):
+        if self._tip is not None and self._tip_icon is icon:
+            self._hide_info()
+            return
+        self._hide_info()
+        tip = tk.Toplevel(self.root)
+        tip.wm_overrideredirect(True)
+        tip.configure(bg=analysis.COLORS["muted"])  # 1px border
+        body = tk.Frame(tip, bg="#ffffff", padx=10, pady=8)
+        body.pack(padx=1, pady=1)
+        tk.Label(body, text=title, bg="#ffffff", fg=analysis.COLORS["ink"],
+                 font=("Segoe UI", 9, "bold"), anchor="w").pack(fill="x")
+        tk.Label(body, text=text, bg="#ffffff", fg=analysis.COLORS["ink2"], font=("Segoe UI", 9),
+                 wraplength=300, justify="left", anchor="w").pack(fill="x", pady=(2, 0))
+        tip.bind("<Button-1>", lambda e: self._hide_info())
+        tip.update_idletasks()
+        x = icon.winfo_rootx() + icon.winfo_width() + 6
+        y = icon.winfo_rooty() - 4
+        # keep the popup on screen
+        x = min(x, tip.winfo_screenwidth() - tip.winfo_reqwidth() - 8)
+        y = min(y, tip.winfo_screenheight() - tip.winfo_reqheight() - 48)
+        tip.geometry(f"+{x}+{y}")
+        self._tip, self._tip_icon = tip, icon
+
+    def _hide_info(self):
+        if self._tip is not None:
+            self._tip.destroy()
+        self._tip = self._tip_icon = None
+
+    def _click_away(self, event):
+        if not getattr(event.widget, "is_info_icon", False):
+            self._hide_info()
 
     def _build_form(self, parent):
         f = self._section(parent, "Instruments")
@@ -101,7 +152,7 @@ class App:
         f = self._section(parent, "LCR meter")
         self._field(f, "frequency", "Frequency (Hz)", FREQUENCIES)
         self._field(f, "level", "Level", ["0.1V", "0.3V", "1.0V"])
-        self._field(f, "speed", "Speed", ["SLOW", "MED", "FAST"])
+        self._field(f, "speed", "Speed (rate @ 1 kHz)", list(SPEED_LABELS.values()))
         self._field(f, "circuit", "Circuit", ["parallel", "series"])
         self._field(f, "average", "Averaging (1–255)")
 
@@ -139,7 +190,6 @@ class App:
         self.stop_btn.pack(side="left", padx=4)
         self.reanalyze_btn = ttk.Button(buttons, text="Re-analyze CSV…", command=self.on_reanalyze)
         self.reanalyze_btn.pack(side="left")
-        ttk.Button(buttons, text="Open folder", command=self._open_folder).pack(side="left", padx=4)
 
     def _build_plots(self, parent):
         self.fig = Figure(figsize=(8, 6), facecolor=analysis.COLORS["surface"])
@@ -166,7 +216,8 @@ class App:
         if not s.output_dir:
             s.output_dir = str(Path.home() / "Documents" / "CvT_data")
         for key, (var, _) in self.vars.items():
-            var.set(getattr(s, key))
+            value = getattr(s, key)
+            var.set(SPEED_LABELS.get(value, value) if key == "speed" else value)
 
     def _save_settings(self, s):
         try:
@@ -182,6 +233,8 @@ class App:
             try:
                 raw = var.get()
                 values[key] = kind(raw) if kind in (float, int) else raw
+                if key == "speed":
+                    values[key] = raw.split(" ")[0].upper()  # "SLOW (~3 Hz)" -> "SLOW"
             except (ValueError, tk.TclError):
                 raise ValueError(f"'{label}' must be a number.")
         return RunSettings(**values)
@@ -210,11 +263,6 @@ class App:
         d = filedialog.askdirectory(initialdir=self.vars["output_dir"][0].get() or None)
         if d:
             self.vars["output_dir"][0].set(d)
-
-    def _open_folder(self):
-        d = self.vars["output_dir"][0].get()
-        if d and Path(d).is_dir():
-            os.startfile(d)
 
     def _set_running(self, running):
         state = "disabled" if running else "normal"
