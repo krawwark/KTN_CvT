@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+
+# Vendor manuals (copyrighted; keep local)
+instrument_docs/
