@@ -1,6 +1,7 @@
 """Tkinter front end: settings form, live plots, start/stop, re-analysis."""
 import json
 import queue
+import threading
 import tkinter as tk
 from dataclasses import asdict, fields
 from pathlib import Path
@@ -10,7 +11,7 @@ from tkinter.scrolledtext import ScrolledText
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
-from . import analysis
+from . import analysis, calibrate
 from .engine import MeasurementRun, RunSettings, ramp_minutes, validate_settings
 from .help_text import HELP
 from .sim import SIM_SPEED
@@ -44,6 +45,9 @@ class App:
         self.current_settings = RunSettings()
         self._tip = None        # open info popup
         self._tip_icon = None   # the ⓘ that opened it
+        self.stray_info = ""    # record of the last stray measurement
+        self._cal_value = None  # stray_pF that record belongs to
+        self._cal_q = None      # events from a running stray measurement
 
         root.title("C–T Measurement")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -155,6 +159,13 @@ class App:
         self._field(f, "speed", "Speed (rate @ 1 kHz)", list(SPEED_LABELS.values()))
         self._field(f, "circuit", "Circuit", ["parallel", "series"])
         self._field(f, "average", "Averaging (1–255)")
+        stray = self._field(f, "stray_pF", "Stray C to subtract (pF)")
+        row = int(stray.grid_info()["row"])
+        self.measure_btn = ttk.Button(f, text="Measure…", command=self.on_measure_stray)
+        self.measure_btn.grid(row=row, column=2, padx=(4, 0))
+        self.inputs.append(self.measure_btn)
+        self.stray_label = ttk.Label(f, foreground="#52514e", font=("Segoe UI", 8), wraplength=280)
+        self.stray_label.grid(row=row + 1, column=0, columnspan=4, sticky="w")
 
         f = self._section(parent, "Temperature program (cooling)")
         self._field(f, "start_temp", "Start (°C)")
@@ -215,6 +226,8 @@ class App:
             pass
         if not s.output_dir:
             s.output_dir = str(Path.home() / "Documents" / "CvT_data")
+        self.stray_info = s.stray_info
+        self._cal_value = s.stray_pF if s.stray_info.startswith("measured") else None
         for key, (var, _) in self.vars.items():
             value = getattr(s, key)
             var.set(SPEED_LABELS.get(value, value) if key == "speed" else value)
@@ -237,11 +250,21 @@ class App:
                     values[key] = raw.split(" ")[0].upper()  # "SLOW (~3 Hz)" -> "SLOW"
             except (ValueError, tk.TclError):
                 raise ValueError(f"'{label}' must be a number.")
+        # The measurement record only applies while the field still holds the measured value.
+        stray = values["stray_pF"]
+        if self._cal_value is not None and abs(stray - self._cal_value) < 0.05:
+            values["stray_info"] = self.stray_info
+        else:
+            values["stray_info"] = "entered manually" if stray else ""
         return RunSettings(**values)
 
     def _update_estimate(self):
         try:
             s = self.collect()
+            if s.stray_info.startswith("measured"):
+                self.stray_label.config(text="Last " + s.stray_info)
+            else:
+                self.stray_label.config(text="Not measured (entered manually)." if s.stray_pF else "")
             errs = validate_settings(s)
             if errs:
                 self.estimate.config(text=errs[0])
@@ -291,6 +314,82 @@ class App:
         self.run.start()
         self.root.after(200, self._poll)
         self.root.after(1000, self._refresh_plot)
+
+    def on_measure_stray(self):
+        try:
+            s = self.collect()
+        except ValueError as e:
+            messagebox.showerror("Invalid setting", str(e))
+            return
+        errs = []
+        if not s.simulate and not s.lcr_port.strip():
+            errs.append("Select the LCR port first.")
+        try:
+            check_f = calibrate.check_frequency(s.frequency)
+        except (ValueError, IndexError):
+            errs.append(f"Frequency '{s.frequency}' is not a number.")
+        if not 1 <= s.average <= 255:
+            errs.append("LCR averaging must be 1-255.")
+        if errs:
+            messagebox.showerror("Cannot measure", "\n".join(errs))
+            return
+        if not messagebox.askokcancel(
+                "Measure stray capacitance",
+                "Unplug the holder's banana leads from the BNC adapter. Leave the meter's clips on "
+                "the adapter and the BNC cable connected and in place, as for a run.\n\n"
+                f"The meter will take readings at {check_f} and {s.frequency}. "
+                "This takes about 20 s."):
+            return
+        self._set_busy(True)
+        self._clear_log()
+        self.status.config(text="Measuring stray capacitance…")
+        self._cal_q = q = queue.Queue()
+
+        def work():
+            try:
+                q.put(("done", calibrate.measure_stray(s, lambda m: q.put(("log", m)))))
+            except Exception as e:
+                q.put(("error", f"{type(e).__name__}: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
+        self.root.after(200, self._poll_cal)
+
+    def _poll_cal(self):
+        while True:
+            try:
+                kind, payload = self._cal_q.get_nowait()
+            except queue.Empty:
+                self.root.after(200, self._poll_cal)
+                return
+            if kind == "log":
+                self.log(payload)
+                continue
+            self._set_busy(False)
+            self._cal_q = None
+            if kind == "error":
+                self.status.config(text="Stray measurement failed.")
+                messagebox.showerror("Stray measurement failed", payload)
+                return
+            r = payload
+            self.status.config(text=f"Stray capacitance: {r['pF']:.1f} ± {r['std_pF']:.1f} pF.")
+            text = (f"Stray capacitance: {r['pF']:.1f} ± {r['std_pF']:.1f} pF (D {r['D']:.2g})\n"
+                    f"Check at {r['check_freq']}: {r['check_pF']:.1f} pF")
+            if r["warnings"]:
+                text += "\n\nWarnings:\n" + "\n".join("• " + w for w in r["warnings"])
+            text += "\n\nUse this value? (Plug the holder's leads back in before starting a run.)"
+            icon = {"icon": "warning"} if r["warnings"] else {}
+            if messagebox.askyesno("Stray capacitance", text, **icon):
+                self.stray_info = r["info"]
+                self._cal_value = round(r["pF"], 1)
+                self.vars["stray_pF"][0].set(f"{self._cal_value:.1f}")
+                self._save_settings(self.collect())
+                self.log(f"Stray C set to {self._cal_value:.1f} pF.")
+            return
+
+    def _set_busy(self, busy):
+        state = "disabled" if busy else "normal"
+        for w in self.inputs + [self.start_btn, self.reanalyze_btn]:
+            w.config(state=state)
 
     def on_stop(self):
         if self.run and messagebox.askyesno("Stop run", "Stop the run? TEC outputs will be turned "
@@ -362,6 +461,12 @@ class App:
         for key in ("csv", "png"):
             if result[key]:
                 self.log(f"Saved {result[key]}")
+        if result["limits_restored"] is False:
+            messagebox.showwarning(
+                "TEC limits not restored",
+                "The TEC temperature limits could not all be put back (see the log). Set them on "
+                "each controller's front panel to the values under \"tec_limits_original\" in "
+                "this run's .json file.")
 
     # -- plotting -----------------------------------------------------------
 

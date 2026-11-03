@@ -62,6 +62,10 @@ class Arroyo5240(SerialInstrument):
         self.write("TEC:MODE:T")
         return idn
 
+    def get_limits(self):
+        """(low, high) temperature limits currently stored on the controller, in deg C."""
+        return float(self.query("TEC:LIM:TLO?")), float(self.query("TEC:LIM:THI?"))
+
     def set_limits(self, t_low, t_high):
         self.write(f"TEC:LIM:TLO {t_low:.2f}")
         self.write(f"TEC:LIM:THI {t_high:.2f}")

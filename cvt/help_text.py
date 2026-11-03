@@ -31,6 +31,15 @@ HELP = {
                "each reading takes N times longer: at SLOW keep N × 0.33 s under the sample "
                "interval. Leave at 1 unless the trace is noisy.",
 
+    "stray_pF": "Capacitance of the leads and holder, subtracted from every reading as a "
+                "capacitance in parallel with the sample (D is corrected too). Press Measure… "
+                "with the holder's banana leads unplugged from the BNC adapter (clips and cable "
+                "left in place) and the program reads it from the meter. Expect a few pF, plus "
+                "about 30 pF per foot of BNC cable. Leave at 0 if the meter's own open "
+                "correction already removes it. A "
+                "constant stray does not move the peak temperature. Raw readings are kept in the "
+                "CSV as C_meas_F and D_meas.",
+
     # Temperature program
     "start_temp": "Where the run begins (the high end). The TECs bring the sample here and hold "
                   "it before cooling starts. Set it above the transition.",

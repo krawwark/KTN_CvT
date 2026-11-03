@@ -36,6 +36,8 @@ class RunSettings:
     speed: str = "SLOW"
     circuit: str = "parallel"
     average: int = 1
+    stray_pF: float = 0.0         # parallel stray capacitance subtracted from every reading
+    stray_info: str = ""          # how stray_pF was obtained (set by the GUI's Measure button)
     # Temperature program
     start_temp: float = 40.0
     stop_temp: float = 15.0
@@ -81,6 +83,13 @@ def validate_settings(s):
         errs.append("LCR speed must be SLOW, MED or FAST.")
     if not 1 <= s.average <= 255:
         errs.append("LCR averaging must be 1-255.")
+    if s.stray_pF < 0:
+        errs.append("Stray capacitance cannot be negative.")
+    elif s.stray_pF > 0:
+        try:
+            analysis.parse_frequency(s.frequency)
+        except (ValueError, IndexError):
+            errs.append(f"Frequency '{s.frequency}' is not a number (needed for the stray correction).")
     return errs
 
 
@@ -107,6 +116,9 @@ class MeasurementRun(threading.Thread):
         self._csv_file = None
         self._lcr_failures = 0
         self._last_split_warn = -math.inf
+        self.orig_limits = {}         # TEC number -> (low, high) found on the controller
+        self._limits_changed = set()  # TEC numbers whose limits this run overwrote
+        self.limits_restored = None   # None: never changed; True/False after shutdown
 
     # -- plumbing ---------------------------------------------------------
 
@@ -166,11 +178,26 @@ class MeasurementRun(threading.Thread):
                                    circuit=s.circuit, average=s.average)
         self.idns["lcr_fetch_command"] = fetch
         self.log(f"LCR: {self.idns['lcr']} (reading with {fetch})")
+        self._freq_hz = analysis.parse_frequency(s.frequency) if s.stray_pF else None
+        if s.stray_pF:
+            self.log(f"Subtracting {s.stray_pF:g} pF stray capacitance from every reading "
+                     f"({s.stray_info or 'entered manually'}). Raw values are saved as "
+                     "C_meas_F and D_meas.")
 
+        # Remember each controller's limits so _shutdown can put them back.
         lo, hi = s.stop_temp - s.limit_margin, s.start_temp + s.limit_margin
-        for tec in self.tecs:
+        for i, tec in enumerate(self.tecs, 1):
+            try:
+                self.orig_limits[i] = tec.get_limits()
+                self.log(f"TEC {i} limits were {self.orig_limits[i][0]:.2f} / "
+                         f"{self.orig_limits[i][1]:.2f} °C.")
+            except Exception as e:
+                self.log(f"WARNING: could not read TEC {i} limits ({e}); "
+                         "they cannot be restored after the run.")
+            self._limits_changed.add(i)
             tec.set_limits(lo, hi)
-        self.log(f"TEC temperature limits set to {lo:.1f} / {hi:.1f} °C.")
+        self.log(f"TEC temperature limits set to {lo:.1f} / {hi:.1f} °C for this run "
+                 "(restored when the run ends).")
 
     def _prepare_files(self):
         out = Path(self.s.output_dir)
@@ -187,6 +214,8 @@ class MeasurementRun(threading.Thread):
 
     def _write_meta(self, **extra):
         meta = {"settings": asdict(self.s), "instruments": self.idns,
+                "tec_limits_original": {f"tec{i}": list(v) for i, v in self.orig_limits.items()},
+                "tec_limits_restored": self.limits_restored,
                 "started": self.started.isoformat(timespec="seconds"), **extra}
         self.csv_path.with_suffix(".json").write_text(json.dumps(meta, indent=2))
 
@@ -198,14 +227,39 @@ class MeasurementRun(threading.Thread):
                 self.log(f"WARNING: could not turn off TEC {i} output: {e}")
         if self.tecs:
             self.log("TEC outputs off.")
+        if self._limits_changed:
+            self.limits_restored = self._restore_limits()
         for inst in [*self.tecs, self.lcr]:
             if inst is not None:
                 inst.close()
         if self._csv_file:
             self._csv_file.close()
 
+    def _restore_limits(self):
+        """Put back the limits found on connect and read them back.
+        Returns True only if every TEC this run changed is verified."""
+        ok = True
+        for i in sorted(self._limits_changed):
+            orig = self.orig_limits.get(i)
+            if orig is None:  # could not be read on connect (already warned)
+                ok = False
+                continue
+            tec = self.tecs[i - 1]
+            try:
+                tec.set_limits(*orig)
+                now = tec.get_limits()
+                if any(abs(a - b) > 0.01 for a, b in zip(now, orig)):
+                    raise RuntimeError(f"controller reports {now[0]:.2f} / {now[1]:.2f} °C")
+                self.log(f"TEC {i} limits restored to {orig[0]:.2f} / {orig[1]:.2f} °C.")
+            except Exception as e:
+                ok = False
+                self.log(f"WARNING: could not restore TEC {i} limits to {orig[0]:.2f} / "
+                         f"{orig[1]:.2f} °C ({e}). Set them on the controller's front panel.")
+        return ok
+
     def _finish(self, aborted, error):
-        result = {"csv": None, "png": None, "peak": None, "aborted": aborted, "error": error}
+        result = {"csv": None, "png": None, "peak": None, "aborted": aborted, "error": error,
+                  "limits_restored": self.limits_restored}
         if self.csv_path is None:
             return result
         result["csv"] = str(self.csv_path)
@@ -243,17 +297,21 @@ class MeasurementRun(threading.Thread):
                 raise RuntimeError(f"LCR meter failed {MAX_LCR_FAILURES} reads in a row: {e}") from e
             self.log(f"LCR read failed ({e}); recording NaN.")
             c = d = math.nan
+        c_meas, d_meas = c, d
+        if self.s.stray_pF:
+            c, d = analysis.remove_stray(c, d, self.s.stray_pF * 1e-12, self.s.circuit, self._freq_hz)
 
         elapsed = self.clock.time() - self.t0
         row = {
             "timestamp": (self.started + timedelta(seconds=elapsed)).isoformat(timespec="seconds"),
             "elapsed_s": elapsed, "phase": phase, "setpoint_C": setpoint,
             "T1_C": t1, "T2_C": t2, "T_avg_C": (t1 + t2) / 2, "C_F": c, "D": d,
+            "C_meas_F": c_meas, "D_meas": d_meas,
         }
         self._writer.writerow({
             **row, "elapsed_s": f"{elapsed:.2f}", "setpoint_C": f"{setpoint:.4f}",
             "T1_C": f"{t1:.4f}", "T2_C": f"{t2:.4f}", "T_avg_C": f"{(t1 + t2) / 2:.4f}",
-            "C_F": f"{c:.6e}", "D": f"{d:.6g}",
+            "C_F": f"{c:.6e}", "D": f"{d:.6g}", "C_meas_F": f"{c_meas:.6e}", "D_meas": f"{d_meas:.6g}",
         })
         self._csv_file.flush()
         self.rows.append(row)

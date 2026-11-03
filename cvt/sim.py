@@ -55,13 +55,17 @@ class SimTEC:
         self.offset = offset
         self.setpoint = thermal.AMBIENT
         self.output = False
+        self.limits = (-10.0, 80.0)
         thermal.tecs.append(self)
 
     def connect(self):
         return "Simulated Arroyo 5240"
 
+    def get_limits(self):
+        return self.limits
+
     def set_limits(self, t_low, t_high):
-        pass
+        self.limits = (t_low, t_high)
 
     def set_temperature(self, temp_c):
         self.setpoint = temp_c
@@ -71,6 +75,24 @@ class SimTEC:
 
     def set_output(self, on):
         self.output = bool(on)
+
+    def close(self):
+        pass
+
+
+class SimOpenLCR:
+    """LCR meter with the holder unplugged: ~170 pF of cable, nearly lossless."""
+
+    STRAY = 170e-12
+
+    def connect(self):
+        return "Simulated MCR5200 (open)"
+
+    def configure(self, **kwargs):
+        return "SIM"
+
+    def read(self):
+        return self.STRAY * (1 + random.gauss(0, 1e-3)), 5e-4 + random.gauss(0, 1e-4)
 
     def close(self):
         pass

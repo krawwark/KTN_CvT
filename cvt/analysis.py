@@ -9,7 +9,40 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 
 CSV_FIELDS = ["timestamp", "elapsed_s", "phase", "setpoint_C",
-              "T1_C", "T2_C", "T_avg_C", "C_F", "D"]
+              "T1_C", "T2_C", "T_avg_C", "C_F", "D",
+              "C_meas_F", "D_meas"]  # as read from the meter, before stray subtraction
+
+_SI = {"": 1.0, "k": 1e3, "K": 1e3, "M": 1e6}
+
+
+def parse_frequency(text):
+    """'1k' -> 1000.0, '120' -> 120.0, '100kHz' -> 100000.0. Raises ValueError."""
+    t = text.strip().removesuffix("Hz").removesuffix("hz").strip()
+    suffix = t[-1:] if t[-1:] in ("k", "K", "M") else ""
+    value = float(t[:len(t) - len(suffix)]) * _SI[suffix]
+    if value <= 0:
+        raise ValueError(f"frequency must be positive: {text!r}")
+    return value
+
+
+def remove_stray(c, d, stray_F, circuit, freq_hz):
+    """Subtract a lossless stray capacitance in parallel with the sample.
+
+    `c`, `d` are the meter's C and D for the given circuit model ("parallel" or
+    "series"). Works on the admittance, so D is corrected too. Returns (c, d)."""
+    if not stray_F or c != c:  # nothing to do, or NaN reading
+        return c, d
+    w = 2 * np.pi * freq_hz
+    if circuit == "parallel":
+        y = complex(d * w * c, w * c)              # G + jwCp, with D = G / (wCp)
+    else:
+        z = complex(d / (w * c), -1 / (w * c))     # Rs - j/(wCs), with D = wRsCs
+        y = 1 / z
+    y -= 1j * w * stray_F
+    if circuit == "parallel":
+        return y.imag / w, y.real / y.imag
+    z = 1 / y
+    return -1 / (w * z.imag), z.real / -z.imag
 
 # Rows used for peak finding; "equilibrate" rows are the approach to the start temperature.
 ANALYSIS_PHASES = ("ramp", "fine", "tail")
